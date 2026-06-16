@@ -89,5 +89,33 @@ class TestPolymarketBot(unittest.TestCase):
             
         self.assertTrue(success)
 
+    def test_telegram_notifier(self):
+        """Test TelegramNotifier initialization and sending states."""
+        from telegram_notifier import TelegramNotifier
+        
+        # When token/chat ID are missing, it should be disabled
+        Config.TELEGRAM_BOT_TOKEN = None
+        Config.TELEGRAM_CHAT_ID = None
+        notifier = TelegramNotifier()
+        self.assertFalse(notifier.enabled)
+        
+        # When token/chat ID are set, it should be enabled
+        Config.TELEGRAM_BOT_TOKEN = "123456:ABC-DEF"
+        Config.TELEGRAM_CHAT_ID = "987654321"
+        notifier = TelegramNotifier()
+        self.assertTrue(notifier.enabled)
+        
+        # Mock actual POST request using unittest mock to avoid external calls
+        from unittest.mock import patch, MagicMock
+        with patch('requests.post') as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            result = notifier.send_message_sync("Test Alert")
+            self.assertTrue(result)
+            mock_post.assert_called_once()
+
+        # Clean config
+        Config.TELEGRAM_BOT_TOKEN = None
+        Config.TELEGRAM_CHAT_ID = None
+
 if __name__ == '__main__':
     unittest.main()

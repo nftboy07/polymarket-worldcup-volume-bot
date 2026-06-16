@@ -1,0 +1,25 @@
+[Unit]
+Description=Polymarket World Cup Volume Farming Bot
+After=network.target
+
+[Service]
+Type=simple
+# Change 'ubuntu' to the appropriate system user on your VPS (e.g., 'root' or 'debian')
+User=ubuntu
+
+# Set this to the absolute path of your project directory on the VPS
+WorkingDirectory=/home/ubuntu/polymarket-worldcup-volume-bot
+
+# Set this to the absolute path of the python executable in the virtual environment
+ExecStart=/home/ubuntu/polymarket-worldcup-volume-bot/venv/bin/python bot.py
+
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+# Respect proxy settings if configured on the VPS
+# Environment="HTTP_PROXY=http://your-proxy:port"
+# Environment="HTTPS_PROXY=http://your-proxy:port"
+
+[Install]
+WantedBy=multi-user.target

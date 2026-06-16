@@ -3,6 +3,7 @@ import logging
 import sys
 from config import Config
 from client import PolymarketClient
+from telegram_notifier import TelegramNotifier
 
 # Setup premium logging format
 logging.basicConfig(
@@ -18,6 +19,7 @@ class VolumeBot:
     def __init__(self):
         Config.validate()
         self.client = PolymarketClient()
+        self.notifier = TelegramNotifier()
         self.strategy = Config.STRATEGY
         self.order_size = Config.ORDER_SIZE
         self.spread = Config.SPREAD
@@ -37,6 +39,15 @@ class VolumeBot:
         logger.info(f"Poll Interval:  {self.poll_interval}s")
         logger.info(f"Dry Run Mode:   {Config.DRY_RUN}")
         logger.info("==================================================")
+        
+        # Send startup alert to Telegram
+        await self.notifier.send_message(
+            f"🤖 **Polymarket Volume Bot Started**\n"
+            f"• Strategy: `{self.strategy.upper()}`\n"
+            f"• Order Size: `{self.order_size} USDC`\n"
+            f"• Spread: `{self.spread}`\n"
+            f"• Dry Run: `{Config.DRY_RUN}`"
+        )
         
         self.is_running = True
         try:
@@ -58,12 +69,17 @@ class VolumeBot:
                         elif self.strategy == "yes_no_offset":
                             await self._run_yes_no_offset(market)
                     except Exception as e:
-                        logger.error(f"Error processing market {market.get('slug')}: {e}")
+                        error_msg = f"Error processing market {market.get('slug')}: {e}"
+                        logger.error(error_msg)
+                        await self.notifier.send_message(f"⚠️ **Market Execution Error**\nMarket: `{market.get('question')[:50]}`\n`{error_msg}`")
                 
                 logger.info(f"Cycle complete. Sleeping for {self.poll_interval}s...\n")
                 await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             logger.info("Bot execution cancelled.")
+        except Exception as e:
+            logger.error(f"Fatal exception in core loop: {e}")
+            await self.notifier.send_message(f"🚨 **Fatal Bot Error in Main Loop**\n`{str(e)}`")
         finally:
             await self.shutdown()
 
@@ -110,15 +126,18 @@ class VolumeBot:
         self.client.cancel_all_orders()
 
         # 5. Place Limit Bids (subject to Max Position thresholds)
+        orders_summary = []
         if pos_yes < self.max_position:
             logger.info(f"Placing Bid for YES: {size_yes} shares @ {bid_price_yes:.2f}")
             self.client.place_limit_order(yes_token, bid_price_yes, size_yes, "buy")
+            orders_summary.append(f"• BUY YES: `{size_yes} shares @ {bid_price_yes}`")
         else:
             logger.warning(f"YES position ({pos_yes}) exceeds max ({self.max_position}). Skipping YES bid.")
 
         if pos_no < self.max_position:
             logger.info(f"Placing Bid for NO: {size_no} shares @ {bid_price_no:.2f}")
             self.client.place_limit_order(no_token, bid_price_no, size_no, "buy")
+            orders_summary.append(f"• BUY NO: `{size_no} shares @ {bid_price_no}`")
         else:
             logger.warning(f"NO position ({pos_no}) exceeds max ({self.max_position}). Skipping NO bid.")
 
@@ -128,12 +147,22 @@ class VolumeBot:
             ask_price_yes = max(0.01, min(0.99, ask_price_yes))
             logger.info(f"Placing Ask for YES: {pos_yes} shares @ {ask_price_yes:.2f}")
             self.client.place_limit_order(yes_token, ask_price_yes, pos_yes, "sell")
+            orders_summary.append(f"• SELL YES: `{pos_yes} shares @ {ask_price_yes}`")
 
         if pos_no > 5.0:
             ask_price_no = round(mid_no + (self.spread / 2.0), 2)
             ask_price_no = max(0.01, min(0.99, ask_price_no))
             logger.info(f"Placing Ask for NO: {pos_no} shares @ {ask_price_no:.2f}")
             self.client.place_limit_order(no_token, ask_price_no, pos_no, "sell")
+            orders_summary.append(f"• SELL NO: `{pos_no} shares @ {ask_price_no}`")
+            
+        if orders_summary:
+            summary_text = "\n".join(orders_summary)
+            await self.notifier.send_message(
+                f"📊 **Market Making Orders Placed**\n"
+                f"Market: `{market['question'][:60]}...`\n"
+                f"{summary_text}"
+            )
 
     async def _run_yes_no_offset(self, market):
         """
@@ -163,6 +192,13 @@ class VolumeBot:
         # Place both orders
         self.client.place_limit_order(yes_token, price_yes, size_yes, "buy")
         self.client.place_limit_order(no_token, price_no, size_no, "buy")
+        
+        await self.notifier.send_message(
+            f"⚡ **Offset Orders Executed**\n"
+            f"Market: `{market['question'][:60]}...`\n"
+            f"• BUY YES: `{size_yes} shares @ {price_yes}`\n"
+            f"• BUY NO: `{size_no} shares @ {price_no}`"
+        )
 
     async def shutdown(self):
         """Cancels orders and stops the bot."""
@@ -171,6 +207,7 @@ class VolumeBot:
             self.client.cancel_all_orders()
         except Exception as e:
             logger.error(f"Error canceling orders during shutdown: {e}")
+        await self.notifier.send_message("🛑 **Polymarket Volume Bot Stopped**")
         logger.info("Shutdown complete.")
 
 def main():

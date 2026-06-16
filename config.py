@@ -38,6 +38,10 @@ class Config:
     API_SECRET = os.getenv("API_SECRET")
     API_PASSPHRASE = os.getenv("API_PASSPHRASE")
 
+    # Telegram Notification configurations
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
     @classmethod
     def validate(cls):
         """Validates configuration settings."""
@@ -53,3 +57,6 @@ class Config:
             raise ValueError("MAX_POSITION must be greater than 0.")
         if cls.POLL_INTERVAL < 1:
             raise ValueError("POLL_INTERVAL must be at least 1 second.")
+        if (cls.TELEGRAM_BOT_TOKEN and not cls.TELEGRAM_CHAT_ID) or (not cls.TELEGRAM_BOT_TOKEN and cls.TELEGRAM_CHAT_ID):
+            raise ValueError("Both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set to enable Telegram alerts.")
+
