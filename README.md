@@ -138,6 +138,29 @@ For rapid volume accumulation:
 
 ---
 
+## Automated Deployment (GitHub Actions)
+
+This repository includes a GitHub Actions workflow that automatically deploys the bot to your VPS on every push to the `main` branch. 
+
+### Setup Instructions
+
+1. **Configure Repository Secrets on GitHub**:
+   - Go to your repository on GitHub.
+   - Navigate to **Settings -> Secrets and variables -> Actions**.
+   - Click **New repository secret** and add the following:
+     - `VPS_HOST`: Your VPS public IP address (e.g., `123.45.67.89`).
+     - `VPS_USERNAME`: The SSH login user (e.g., `ubuntu` or `root`).
+     - `VPS_SSH_KEY`: The contents of your private SSH key (e.g., `id_rsa`) that has authorization to access your VPS.
+     - `VPS_PASSWORD` *(Alternative)*: If you do not use SSH keys, configure this with your SSH login password instead.
+     - `ENV_CONTENT`: The complete contents of your configured `.env` file (e.g., wallet private key `PK`, Telegram credentials, dry-run flags).
+
+2. **Triggering Deployment**:
+   - Whenever you push code changes to the `main` branch, the workflow will trigger.
+   - It will automatically establish an SSH connection to your VPS, pull the latest code, write your secrets to `.env`, set up the virtual environment, and start/restart the background `systemd` daemon.
+
+---
+
 ## Disclaimer
 
 This bot is for educational purposes only. Automated trading on prediction markets involves financial risk. Wash trading or collusive volume manipulation is against Polymarket's Market Integrity rules and could result in account restriction. Use responsibly.
+
