@@ -11,7 +11,7 @@ logger.setLevel(logging.INFO)
 # This allows testing the logic and running in simulation/dry-run mode
 # even if the heavy library or dependencies fail to install in a sandbox.
 try:
-    from py_clob_client_v2 import ClobClient, ApiCreds, OrderArgs, OrderType, PartialCreateOrderOptions, Side
+    from py_clob_client_v2 import ClobClient, ApiCreds, OrderArgs, OrderType, PartialCreateOrderOptions, Side, BalanceAllowanceParams, AssetType
     CLOB_SDK_AVAILABLE = True
 except ImportError:
     CLOB_SDK_AVAILABLE = False
@@ -235,10 +235,13 @@ class PolymarketClient:
             return 0.0
             
         try:
-            # Query on-chain ERC1155 token balance or CLOB positions endpoint
-            # In CLOB SDK, we can query our balance for the specific token_id.
-            balance_raw = self.clob_client.get_balance(token_id)
-            return float(balance_raw.get("balance", 0))
+            # In CLOB V2 SDK, get_balance_allowance is used
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id
+            )
+            balance_raw = self.clob_client.get_balance_allowance(params)
+            return float(balance_raw.get("balance", 0.0))
         except Exception as e:
             logger.error(f"Error fetching position for token {token_id}: {e}")
             return 0.0
