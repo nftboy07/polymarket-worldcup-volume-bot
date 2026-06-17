@@ -56,11 +56,23 @@ class PolymarketClient:
             else:
                 logger.info("Deriving/creating L2 API credentials from wallet signature...")
                 raw_creds = self.clob_client.create_or_derive_api_key()
-                creds = ApiCreds(
-                    api_key=raw_creds.get("apiKey") or raw_creds.get("api_key"),
-                    api_secret=raw_creds.get("apiSecret") or raw_creds.get("api_secret"),
-                    api_passphrase=raw_creds.get("apiPassphrase") or raw_creds.get("api_passphrase")
-                )
+                
+                # Support both dictionary and ApiCreds object structures returned by the SDK
+                if hasattr(raw_creds, "api_key") and raw_creds.api_key:
+                    creds = raw_creds
+                elif isinstance(raw_creds, dict):
+                    creds = ApiCreds(
+                        api_key=raw_creds.get("apiKey") or raw_creds.get("api_key"),
+                        api_secret=raw_creds.get("apiSecret") or raw_creds.get("api_secret"),
+                        api_passphrase=raw_creds.get("apiPassphrase") or raw_creds.get("api_passphrase")
+                    )
+                else:
+                    creds = ApiCreds(
+                        api_key=getattr(raw_creds, "api_key", None) or getattr(raw_creds, "apiKey", None),
+                        api_secret=getattr(raw_creds, "api_secret", None) or getattr(raw_creds, "apiSecret", None),
+                        api_passphrase=getattr(raw_creds, "api_passphrase", None) or getattr(raw_creds, "apiPassphrase", None)
+                    )
+            
             
             # Re-initialize CLOB client with both L1 and L2 authentication
             self.clob_client = ClobClient(
