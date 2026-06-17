@@ -16,10 +16,7 @@ ExecStart=/home/ubuntu/polymarket-worldcup-volume-bot/venv/bin/python bot.py
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
-
-# Respect proxy settings if configured on the VPS
-# Environment="HTTP_PROXY=http://your-proxy:port"
-# Environment="HTTPS_PROXY=http://your-proxy:port"
+EnvironmentFile=/home/ubuntu/polymarket-worldcup-volume-bot/.env
 
 [Install]
 WantedBy=multi-user.target
