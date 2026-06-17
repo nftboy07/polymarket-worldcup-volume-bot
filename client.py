@@ -38,11 +38,13 @@ class PolymarketClient:
         """Initializes the actual Polymarket CLOB client using PK and API credentials."""
         try:
             logger.info("Initializing CLOB client and L1 authentication...")
-            # Initialize with L1 Wallet credentials
+            # Initialize with L1 Wallet credentials and L2 deposit wallet credentials
             self.clob_client = ClobClient(
                 host=Config.CLOB_API_URL, 
                 chain_id=137, 
-                key=Config.PK
+                key=Config.PK,
+                signature_type=Config.SIGNATURE_TYPE,
+                funder=Config.FUNDER
             )
             
             # Derive L2 API credentials if not explicitly provided

@@ -38,6 +38,10 @@ class Config:
     API_SECRET = os.getenv("API_SECRET")
     API_PASSPHRASE = os.getenv("API_PASSPHRASE")
 
+    # Optional signature type and funder (deposit wallet flow)
+    SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "1"))
+    FUNDER = os.getenv("FUNDER")
+
     # Telegram Notification configurations
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
