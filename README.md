@@ -63,6 +63,13 @@ API_KEY=
 API_SECRET=
 API_PASSPHRASE=
 
+# --- DEPOSIT WALLET FLOW (REQUIRED for most Polymarket accounts) ---
+# Polymarket now requires deposit wallet flow for most users.
+# SIGNATURE_TYPE=3 (POLY_1271) is required for deposit wallets.
+# FUNDER = your deposit wallet address from your Polymarket profile.
+SIGNATURE_TYPE=3
+FUNDER=0x...
+
 # --- BOT SETTINGS ---
 # Mode: "true" to simulate, "false" to execute live orders
 DRY_RUN=true
@@ -81,6 +88,10 @@ MAX_POSITION=50.0
 
 # Polling frequency in seconds
 POLL_INTERVAL=10
+
+# --- TELEGRAM NOTIFICATIONS (Optional) ---
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
 
 ### Running with a Proxy
@@ -100,6 +111,22 @@ export HTTP_PROXY="http://your-proxy-address:port"
 export HTTPS_PROXY="http://your-proxy-address:port"
 python bot.py
 ```
+
+---
+
+## Deposit Wallet Flow (Required for Live Trading)
+
+Polymarket now requires the **deposit wallet flow** for most accounts. If you see the error `maker address not allowed, please use the deposit wallet flow`, you must configure:
+
+1. Go to your **Polymarket Profile** → copy your **Deposit Wallet** address.
+2. Add to your `.env`:
+   ```env
+   SIGNATURE_TYPE=3
+   FUNDER=0xYourDepositWalletAddress
+   ```
+3. Restart the bot.
+
+> **Note:** `SIGNATURE_TYPE=3` (POLY_1271) tells the CLOB SDK to sign orders using the deposit wallet instead of your raw EOA. Without this, every order will be rejected with a 400 error.
 
 ---
 

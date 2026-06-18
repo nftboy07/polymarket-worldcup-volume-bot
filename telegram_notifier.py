@@ -7,14 +7,8 @@ logger = logging.getLogger("PolymarketBot.Telegram")
 
 class TelegramNotifier:
     def __init__(self):
-        self.enabled = (
-            Config.API_KEY is not None # Config load check helper
-            and os_env_has_telegram()
-        )
-        # Note: we will load values dynamically from Config
         self.bot_token = getattr(Config, "TELEGRAM_BOT_TOKEN", None)
         self.chat_id = getattr(Config, "TELEGRAM_CHAT_ID", None)
-        
         self.enabled = bool(self.bot_token and self.chat_id)
         if self.enabled:
             logger.info("Telegram notification integration enabled.")

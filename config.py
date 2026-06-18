@@ -39,7 +39,9 @@ class Config:
     API_PASSPHRASE = os.getenv("API_PASSPHRASE")
 
     # Optional signature type and funder (deposit wallet flow)
-    SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "1"))
+    # SIGNATURE_TYPE=3 (POLY_1271) is REQUIRED for deposit wallet flow on Polymarket.
+    # If your account requires deposit wallet, set SIGNATURE_TYPE=3 and FUNDER=<your deposit address>.
+    SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "3"))
     FUNDER = os.getenv("FUNDER")
 
     # Telegram Notification configurations
@@ -51,6 +53,16 @@ class Config:
         """Validates configuration settings."""
         if not cls.DRY_RUN and not cls.PK:
             raise ValueError("PRIVATE KEY (PK) must be set in .env to run in production mode.")
+        if not cls.DRY_RUN and not cls.FUNDER:
+            raise ValueError(
+                "FUNDER (deposit wallet address) must be set in .env to run in production mode.\n"
+                "Polymarket requires deposit wallet flow for most accounts.\n"
+                "Get your deposit address from your Polymarket profile and set:\n"
+                "  FUNDER=0xYourDepositWalletAddress\n"
+                "  SIGNATURE_TYPE=3"
+            )
+        if cls.SIGNATURE_TYPE not in (1, 3):
+            raise ValueError(f"SIGNATURE_TYPE must be 1 or 3. Got {cls.SIGNATURE_TYPE}.")
         if cls.STRATEGY not in ("market_making", "yes_no_offset"):
             raise ValueError(f"Invalid strategy: {cls.STRATEGY}. Must be 'market_making' or 'yes_no_offset'.")
         if cls.ORDER_SIZE <= 0:

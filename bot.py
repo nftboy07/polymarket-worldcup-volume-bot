@@ -26,6 +26,30 @@ class VolumeBot:
         self.max_position = Config.MAX_POSITION
         self.poll_interval = Config.POLL_INTERVAL
         self.is_running = False
+        # Track last error per market to avoid Telegram spam
+        self._last_errors = {}  # market_slug -> (error_hash, timestamp)
+        self._error_cooldown_seconds = 300  # 5 minutes
+
+    def _should_notify_error(self, market_slug, error_msg):
+        """Returns True if we should send this error to Telegram (new error or cooldown passed)."""
+        import hashlib, time
+        error_hash = hashlib.md5(error_msg.encode()).hexdigest()
+        now = time.time()
+        last_hash, last_time = self._last_errors.get(market_slug, (None, 0))
+        if last_hash == error_hash and (now - last_time) < self._error_cooldown_seconds:
+            return False
+        self._last_errors[market_slug] = (error_hash, now)
+        return True
+
+    def _format_error_for_telegram(self, market_question, error_msg):
+        """Formats an error message nicely for Telegram (truncates, escapes markdown)."""
+        # Truncate question
+        q = market_question[:55] + "..." if len(market_question) > 55 else market_question
+        # Clean error message: remove backticks, newlines, truncate
+        clean = error_msg.replace("`", "'").replace("\n", " | ")
+        if len(clean) > 200:
+            clean = clean[:197] + "..."
+        return f"⚠️ **Market Error**\nMarket: `{q}`\n`{clean}`"
 
     async def start(self):
         """Starts the main bot execution loop."""
@@ -69,9 +93,14 @@ class VolumeBot:
                         elif self.strategy == "yes_no_offset":
                             await self._run_yes_no_offset(market)
                     except Exception as e:
-                        error_msg = f"Error processing market {market.get('slug')}: {e}"
+                        market_slug = market.get('slug', 'unknown')
+                        error_msg = f"Error processing market {market_slug}: {e}"
                         logger.error(error_msg)
-                        await self.notifier.send_message(f"⚠️ **Market Execution Error**\nMarket: `{market.get('question')[:50]}`\n`{error_msg}`")
+                        if self._should_notify_error(market_slug, error_msg):
+                            tg_msg = self._format_error_for_telegram(market.get('question', 'Unknown'), str(e))
+                            await self.notifier.send_message(tg_msg)
+                        else:
+                            logger.info(f"Suppressing duplicate Telegram alert for {market_slug} (cooldown active).")
                 
                 logger.info(f"Cycle complete. Sleeping for {self.poll_interval}s...\n")
                 await asyncio.sleep(self.poll_interval)

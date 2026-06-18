@@ -210,6 +210,18 @@ class PolymarketClient:
             logger.info(f"Order placed successfully: {resp}")
             return resp
         except Exception as e:
+            error_text = str(e)
+            if "maker address not allowed" in error_text.lower() or "deposit wallet flow" in error_text.lower():
+                raise RuntimeError(
+                    "DEPOSIT WALLET FLOW ERROR: Polymarket rejected the order because the "
+                    "maker address is your raw EOA, not the deposit wallet.\n\n"
+                    "TO FIX:\n"
+                    "1. Go to your Polymarket profile and copy your Deposit Wallet address.\n"
+                    "2. Add this to your .env file:\n"
+                    "   FUNDER=0xYourDepositWalletAddress\n"
+                    "   SIGNATURE_TYPE=3\n"
+                    "3. Restart the bot."
+                ) from e
             logger.error(f"Error placing order: {e}")
             raise e
 
