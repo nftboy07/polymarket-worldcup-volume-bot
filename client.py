@@ -38,7 +38,9 @@ class PolymarketClient:
         """Initializes the actual Polymarket CLOB client using PK and API credentials."""
         try:
             logger.info("Initializing CLOB client and L1 authentication...")
-            # Initialize with L1 Wallet credentials and L2 deposit wallet credentials
+            # Initialize with L1 Wallet credentials, signature type, and funder (deposit wallet).
+            # SIGNATURE_TYPE=3 (POLY_1271) is required when using the deposit wallet flow.
+            # FUNDER must be the deposit/proxy wallet address from Polymarket profile.
             self.clob_client = ClobClient(
                 host=Config.CLOB_API_URL, 
                 chain_id=137, 
@@ -47,7 +49,9 @@ class PolymarketClient:
                 funder=Config.FUNDER
             )
             
-            # Derive L2 API credentials if not explicitly provided
+            # Derive L2 API credentials if not explicitly provided.
+            # When using deposit wallet flow (POLY_1271), credentials are derived relative
+            # to the funder address, not the raw EOA, so we pass the same context.
             if Config.API_KEY and Config.API_SECRET and Config.API_PASSPHRASE:
                 logger.info("Using provided L2 API credentials.")
                 creds = ApiCreds(
@@ -75,13 +79,17 @@ class PolymarketClient:
                         api_passphrase=getattr(raw_creds, "api_passphrase", None) or getattr(raw_creds, "apiPassphrase", None)
                     )
             
-            
-            # Re-initialize CLOB client with both L1 and L2 authentication
+            # Re-initialize CLOB client with BOTH L1+L2 auth AND the deposit wallet context.
+            # CRITICAL: signature_type and funder MUST be passed here too — omitting them
+            # causes orders to be built with the raw EOA as maker, triggering the 
+            # "maker address not allowed, please use the deposit wallet flow" 400 error.
             self.clob_client = ClobClient(
                 host=Config.CLOB_API_URL, 
                 chain_id=137, 
                 key=Config.PK,
-                creds=creds
+                creds=creds,
+                signature_type=Config.SIGNATURE_TYPE,
+                funder=Config.FUNDER
             )
             self.authenticated = True
             logger.info("CLOB Client authenticated successfully.")
