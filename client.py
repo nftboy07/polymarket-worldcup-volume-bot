@@ -26,14 +26,13 @@ class PolymarketClient:
         self.market_rules = {}
         self._market_rules_ttl = 300
         self._last_rules_refresh = {}
-        self._init_lock = False
         if not self.dry_run:
             if not CLOB_SDK_AVAILABLE:
                 raise ImportError("py-clob-client-v2 is required when DRY_RUN=false")
             self._init_clob_client()
 
     def _init_clob_client(self):
-        self.clob_client = ClobClient(
+        bootstrap = ClobClient(
             host=Config.CLOB_API_URL,
             chain_id=137,
             key=Config.PK,
@@ -41,13 +40,9 @@ class PolymarketClient:
             funder=Config.FUNDER,
         )
         if Config.API_KEY and Config.API_SECRET and Config.API_PASSPHRASE:
-            creds = ApiCreds(
-                api_key=Config.API_KEY,
-                api_secret=Config.API_SECRET,
-                api_passphrase=Config.API_PASSPHRASE,
-            )
+            creds = ApiCreds(api_key=Config.API_KEY, api_secret=Config.API_SECRET, api_passphrase=Config.API_PASSPHRASE)
         else:
-            raw = self.clob_client.create_or_derive_api_key()
+            raw = bootstrap.create_or_derive_api_key()
             if hasattr(raw, "api_key"):
                 creds = raw
             else:
@@ -76,10 +71,9 @@ class PolymarketClient:
         return value if isinstance(value, list) else []
 
     def fetch_world_cup_markets(self):
-        url = f"{Config.GAMMA_API_URL}/public-search"
         try:
             response = self.session.get(
-                url,
+                f"{Config.GAMMA_API_URL}/public-search",
                 params={"q": "World Cup"},
                 headers={"User-Agent": "PolymarketMM/2.0"},
                 timeout=10,
@@ -113,7 +107,7 @@ class PolymarketClient:
                         "neg_risk": bool(market.get("negRisk", False)),
                     })
             markets.sort(key=lambda m: m["liquidity"], reverse=True)
-            return markets[: Config.MAX_MARKETS]
+            return markets[:Config.MAX_MARKETS]
         except Exception as exc:
             logger.error("Market discovery failed: %s", exc)
             if self.dry_run:
@@ -156,7 +150,6 @@ class PolymarketClient:
         tick = fallback_tick
         min_size = 5.0
         if not self.dry_run:
-            # The SDK/API can differ by installed V2 version, so probe safely.
             try:
                 getter = getattr(self.clob_client, "get_tick_size", None)
                 if getter:
@@ -170,11 +163,7 @@ class PolymarketClient:
             except Exception:
                 pass
             try:
-                response = self.session.get(
-                    f"{Config.CLOB_API_URL}/tick-size",
-                    params={"token_id": token_id},
-                    timeout=5,
-                )
+                response = self.session.get(f"{Config.CLOB_API_URL}/tick-size", params={"token_id": token_id}, timeout=5)
                 if response.ok:
                     payload = response.json()
                     tick = float(payload.get("minimum_tick_size", payload.get("tick_size", tick)))
@@ -192,7 +181,7 @@ class PolymarketClient:
         value = (Decimal(str(price)) / tick).to_integral_value(rounding=ROUND_DOWN) * tick
         return float(max(Decimal("0.01"), min(Decimal("0.99"), value)))
 
-    def place_limit_order(self, token_id, price, size, side, tick_size=0.01, post_only=False):
+    def place_limit_order(self, token_id, price, size, side, tick_size=0.01, neg_risk=False):
         price = self.round_price(price, tick_size)
         size = float(size)
         if size <= 0:
@@ -203,12 +192,12 @@ class PolymarketClient:
         if self.dry_run:
             return {"status": "SIMULATED", "orderID": f"dry-{token_id[:8]}-{int(time.time()*1000)}"}
         clob_side = Side.BUY if str(side).lower() == "buy" else Side.SELL
-        options = PartialCreateOrderOptions(tick_size=str(rules["tick_size"]))
-        # Keep the SDK-compatible path conservative; do not invent unsupported kwargs.
+        options = PartialCreateOrderOptions(tick_size=str(rules["tick_size"]), neg_risk=bool(neg_risk))
         return self.clob_client.create_and_post_order(
             order_args=OrderArgs(token_id=token_id, price=price, side=clob_side, size=size),
             options=options,
             order_type=OrderType.GTC,
+            post_only=True,
         )
 
     def cancel_order(self, order_id):
@@ -237,7 +226,6 @@ class PolymarketClient:
             raw = self.clob_client.get_balance_allowance(params)
             return float(raw.get("balance", 0.0))
         except Exception as exc:
-            # Never convert an unknown account state into zero exposure.
             raise RuntimeError(f"Position lookup failed for {token_id}: {exc}") from exc
 
     def _get_mock_world_cup_markets(self):
