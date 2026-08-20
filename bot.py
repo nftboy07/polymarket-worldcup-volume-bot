@@ -1,250 +1,234 @@
 import asyncio
 import logging
 import sys
+import time
 from config import Config
 from client import PolymarketClient
 from telegram_notifier import TelegramNotifier
 
-# Setup premium logging format
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("PolymarketBot.Core")
+
 
 class VolumeBot:
     def __init__(self):
         Config.validate()
         self.client = PolymarketClient()
         self.notifier = TelegramNotifier()
-        self.strategy = Config.STRATEGY
-        self.order_size = Config.ORDER_SIZE
-        self.spread = Config.SPREAD
-        self.max_position = Config.MAX_POSITION
-        self.poll_interval = Config.POLL_INTERVAL
         self.is_running = False
-        # Track last error per market to avoid Telegram spam
-        self._last_errors = {}  # market_slug -> (error_hash, timestamp)
-        self._error_cooldown_seconds = 300  # 5 minutes
+        self.kill_switch = False
+        self.consecutive_errors = 0
+        self.market_error_counts = {}
+        self.last_quotes = {}
 
-    def _should_notify_error(self, market_slug, error_msg):
-        """Returns True if we should send this error to Telegram (new error or cooldown passed)."""
-        import hashlib, time
-        error_hash = hashlib.md5(error_msg.encode()).hexdigest()
+    async def _call(self, fn, *args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    async def _notify(self, message):
+        try:
+            await self.notifier.send_message(message)
+        except Exception as exc:
+            logger.warning("Telegram notification failed: %s", exc)
+
+    @staticmethod
+    def _order_field(order, *names, default=None):
+        if isinstance(order, dict):
+            for name in names:
+                if name in order:
+                    return order[name]
+        else:
+            for name in names:
+                value = getattr(order, name, None)
+                if value is not None:
+                    return value
+        return default
+
+    def _normalize_open_order(self, order):
+        return {
+            "id": self._order_field(order, "id", "orderID", "order_id"),
+            "token_id": self._order_field(order, "asset_id", "token_id", "tokenId"),
+            "side": str(self._order_field(order, "side", default="")).upper(),
+            "price": float(self._order_field(order, "price", default=0)),
+            "size": float(self._order_field(order, "original_size", "size", default=0)),
+            "created_at": self._order_field(order, "created_at", "createdAt", default=None),
+        }
+
+    async def _cancel_stale_orders(self, open_orders):
         now = time.time()
-        last_hash, last_time = self._last_errors.get(market_slug, (None, 0))
-        if last_hash == error_hash and (now - last_time) < self._error_cooldown_seconds:
-            return False
-        self._last_errors[market_slug] = (error_hash, now)
-        return True
+        for raw in open_orders:
+            order = self._normalize_open_order(raw)
+            if not order["id"]:
+                continue
+            created = order["created_at"]
+            stale = False
+            if isinstance(created, (int, float)):
+                stale = now - float(created) > Config.STALE_ORDER_SECONDS
+            if stale:
+                try:
+                    await self._call(self.client.cancel_order, order["id"])
+                    logger.info("Canceled stale order %s", order["id"])
+                except Exception as exc:
+                    logger.warning("Could not cancel stale order %s: %s", order["id"], exc)
 
-    def _format_error_for_telegram(self, market_question, error_msg):
-        """Formats an error message nicely for Telegram (truncates, escapes markdown)."""
-        # Truncate question
-        q = market_question[:55] + "..." if len(market_question) > 55 else market_question
-        # Clean error message: remove backticks, newlines, truncate
-        clean = error_msg.replace("`", "'").replace("\n", " | ")
-        if len(clean) > 200:
-            clean = clean[:197] + "..."
-        return f"⚠️ **Market Error**\nMarket: `{q}`\n`{clean}`"
+    async def _emergency_stop(self, reason):
+        if self.kill_switch:
+            return
+        self.kill_switch = True
+        self.is_running = False
+        logger.error("EMERGENCY STOP: %s", reason)
+        try:
+            await self._call(self.client.cancel_all_orders)
+        except Exception as exc:
+            logger.critical("Emergency cancellation failed: %s", exc)
+        await self._notify(f"🚨 **BOT HALTED**\nReason: `{reason[:250]}`")
 
     async def start(self):
-        """Starts the main bot execution loop."""
-        logger.info("==================================================")
-        logger.info("      POLYMARKET WORLD CUP VOLUME FARMING BOT     ")
-        logger.info("==================================================")
-        logger.info(f"Strategy:       {self.strategy.upper()}")
-        logger.info(f"Order Size:     {self.order_size} USDC")
-        logger.info(f"Spread:         {self.spread}")
-        logger.info(f"Max Position:   {self.max_position} shares")
-        logger.info(f"Poll Interval:  {self.poll_interval}s")
-        logger.info(f"Dry Run Mode:   {Config.DRY_RUN}")
-        logger.info("==================================================")
-        
-        # Send startup alert to Telegram
-        await self.notifier.send_message(
-            f"🤖 **Polymarket Volume Bot Started**\n"
-            f"• Strategy: `{self.strategy.upper()}`\n"
-            f"• Order Size: `{self.order_size} USDC`\n"
-            f"• Spread: `{self.spread}`\n"
-            f"• Dry Run: `{Config.DRY_RUN}`"
+        logger.info("Starting hardened Polymarket market maker")
+        logger.info("Dry run=%s | order=$%.2f | spread=%.4f | max position=%.2f | max exposure=%.2f",
+                    Config.DRY_RUN, Config.ORDER_SIZE, Config.SPREAD,
+                    Config.MAX_POSITION, Config.MAX_TOTAL_EXPOSURE)
+        await self._notify(
+            f"🤖 **Polymarket MM Started**\n"
+            f"• Dry run: `{Config.DRY_RUN}`\n"
+            f"• Order size: `${Config.ORDER_SIZE:.2f}`\n"
+            f"• Spread: `{Config.SPREAD:.4f}`\n"
+            f"• Max exposure: `${Config.MAX_TOTAL_EXPOSURE:.2f}`"
         )
-        
         self.is_running = True
         try:
-            while self.is_running:
-                logger.info("Starting polling cycle...")
-                # 1. Fetch active World Cup markets
-                markets = self.client.fetch_world_cup_markets()
-                
-                if not markets:
-                    logger.warning("No active World Cup markets found. Sleeping...")
-                    await asyncio.sleep(self.poll_interval)
-                    continue
-
-                for market in markets:
-                    try:
-                        logger.info(f"Analyzing market: {market['question']}")
-                        if self.strategy == "market_making":
-                            await self._run_market_making(market)
-                        elif self.strategy == "yes_no_offset":
-                            await self._run_yes_no_offset(market)
-                    except Exception as e:
-                        market_slug = market.get('slug', 'unknown')
-                        error_msg = f"Error processing market {market_slug}: {e}"
-                        logger.error(error_msg)
-                        if self._should_notify_error(market_slug, error_msg):
-                            tg_msg = self._format_error_for_telegram(market.get('question', 'Unknown'), str(e))
-                            await self.notifier.send_message(tg_msg)
-                        else:
-                            logger.info(f"Suppressing duplicate Telegram alert for {market_slug} (cooldown active).")
-                
-                logger.info(f"Cycle complete. Sleeping for {self.poll_interval}s...\n")
-                await asyncio.sleep(self.poll_interval)
-        except asyncio.CancelledError:
-            logger.info("Bot execution cancelled.")
-        except Exception as e:
-            logger.error(f"Fatal exception in core loop: {e}")
-            await self.notifier.send_message(f"🚨 **Fatal Bot Error in Main Loop**\n`{str(e)}`")
+            while self.is_running and not self.kill_switch:
+                try:
+                    await self._run_cycle()
+                    self.consecutive_errors = 0
+                except Exception as exc:
+                    self.consecutive_errors += 1
+                    logger.exception("Cycle failed (%s/%s)", self.consecutive_errors, Config.MAX_CONSECUTIVE_ERRORS)
+                    if self.consecutive_errors >= Config.MAX_CONSECUTIVE_ERRORS:
+                        await self._emergency_stop(f"{self.consecutive_errors} consecutive cycle failures: {exc}")
+                        break
+                await asyncio.sleep(Config.POLL_INTERVAL)
         finally:
             await self.shutdown()
 
-    async def _run_market_making(self, market):
-        """
-        Executes Dual-Buy Market Making strategy on a market:
-        - Fetch midpoint price M for YES token.
-        - Calculate bid for YES = M - spread/2
-        - Calculate bid for NO = (1 - M) - spread/2
-        - Cancel previous orders on this market.
-        - Place new limit orders.
-        """
-        yes_token = market["yes_token"]
-        no_token = market["no_token"]
+    async def _run_cycle(self):
+        markets = await self._call(self.client.fetch_world_cup_markets)
+        if not markets:
+            logger.info("No eligible active markets")
+            return
 
-        # 1. Fetch current midpoint price
+        open_orders = await self._call(self.client.get_open_orders)
+        if len(open_orders) > Config.MAX_OPEN_ORDERS:
+            await self._emergency_stop("Open-order limit exceeded")
+            return
+        await self._cancel_stale_orders(open_orders)
+
+        for market in markets[:Config.MAX_MARKETS]:
+            if self.kill_switch:
+                return
+            try:
+                await self._quote_market(market)
+            except Exception as exc:
+                slug = market.get("slug", "unknown")
+                self.market_error_counts[slug] = self.market_error_counts.get(slug, 0) + 1
+                logger.error("Market %s failed: %s", slug, exc)
+                if self.market_error_counts[slug] >= Config.MAX_CONSECUTIVE_ERRORS:
+                    await self._emergency_stop(f"Repeated failure on {slug}: {exc}")
+                    return
+
+    async def _quote_market(self, market):
+        if not market.get("active", True):
+            return
+        if market.get("liquidity", 0) < Config.MIN_LIQUIDITY:
+            logger.debug("Skipping %s: insufficient liquidity", market.get("slug"))
+            return
+
+        yes = market["yes_token"]
+        no = market["no_token"]
+        yes_bid, yes_ask, yes_mid = await self._call(self.client.quote_from_book, yes)
+        no_bid, no_ask, no_mid = await self._call(self.client.quote_from_book, no)
+
+        if yes_ask - yes_bid > Config.MAX_SPREAD or no_ask - no_bid > Config.MAX_SPREAD:
+            logger.info("Skipping %s: book spread too wide", market.get("slug"))
+            return
+
+        pos_yes = await self._call(self.client.get_position, yes)
+        pos_no = await self._call(self.client.get_position, no)
+        current_exposure = abs(pos_yes) * yes_mid + abs(pos_no) * no_mid
+        if current_exposure >= Config.MAX_TOTAL_EXPOSURE:
+            logger.info("Skipping buys for %s: exposure %.2f >= %.2f", market.get("slug"), current_exposure, Config.MAX_TOTAL_EXPOSURE)
+            return
+
+        yes_rules = await self._call(self.client.get_market_rules, yes)
+        no_rules = await self._call(self.client.get_market_rules, no)
+        tick_yes = yes_rules["tick_size"]
+        tick_no = no_rules["tick_size"]
+
+        # Passive quotes only: improve neither side through the spread.
+        yes_price = min(yes_ask - tick_yes, yes_mid - Config.SPREAD / 2)
+        no_price = min(no_ask - tick_no, no_mid - Config.SPREAD / 2)
+        yes_price = self.client.round_price(yes_price, tick_yes)
+        no_price = self.client.round_price(no_price, tick_no)
+
+        yes_size = Config.ORDER_SIZE / max(yes_price, 0.01)
+        no_size = Config.ORDER_SIZE / max(no_price, 0.01)
+
+        if pos_yes < Config.MAX_POSITION and current_exposure + Config.ORDER_SIZE <= Config.MAX_TOTAL_EXPOSURE:
+            await self._ensure_quote(yes, "BUY", yes_price, yes_size, tick_yes)
+        if pos_no < Config.MAX_POSITION and current_exposure + Config.ORDER_SIZE <= Config.MAX_TOTAL_EXPOSURE:
+            await self._ensure_quote(no, "BUY", no_price, no_size, tick_no)
+
+        # Inventory reduction: only quote an ask when inventory exists.
+        if pos_yes > 0:
+            ask = max(yes_bid + tick_yes, yes_mid + Config.SPREAD / 2)
+            await self._ensure_quote(yes, "SELL", self.client.round_price(ask, tick_yes), pos_yes, tick_yes)
+        if pos_no > 0:
+            ask = max(no_bid + tick_no, no_mid + Config.SPREAD / 2)
+            await self._ensure_quote(no, "SELL", self.client.round_price(ask, tick_no), pos_no, tick_no)
+
+    async def _ensure_quote(self, token_id, side, price, size, tick_size):
+        key = (token_id, side)
+        previous = self.last_quotes.get(key)
+        if previous:
+            old_price, old_size, timestamp = previous
+            if abs(old_price - price) < Config.REPRICE_THRESHOLD and time.time() - timestamp < Config.STALE_ORDER_SECONDS:
+                return
         try:
-            mid_yes = self.client.get_midpoint_price(yes_token)
-        except Exception:
-            # Fallback to Gamma API prices if CLOB midpoint fails
-            mid_yes = float(market["prices"][0])
-
-        mid_no = 1.0 - mid_yes
-        logger.info(f"Prices - YES Midpoint: {mid_yes:.2f} | NO Midpoint: {mid_no:.2f}")
-
-        # 2. Check current positions to manage inventory risk
-        pos_yes = self.client.get_position(yes_token)
-        pos_no = self.client.get_position(no_token)
-        logger.info(f"Positions - YES: {pos_yes} shares | NO: {pos_no} shares")
-
-        # 3. Calculate order prices and sizes
-        bid_price_yes = round(mid_yes - (self.spread / 2.0), 2)
-        bid_price_no = round(mid_no - (self.spread / 2.0), 2)
-
-        # Boundaries check
-        bid_price_yes = max(0.01, min(0.99, bid_price_yes))
-        bid_price_no = max(0.01, min(0.99, bid_price_no))
-
-        # Size in shares = USDC Order size / Price
-        size_yes = round(self.order_size / bid_price_yes, 2)
-        size_no = round(self.order_size / bid_price_no, 2)
-
-        # 4. Cancel existing open orders before placing new ones
-        self.client.cancel_all_orders()
-
-        # 5. Place Limit Bids (subject to Max Position thresholds)
-        orders_summary = []
-        if pos_yes < self.max_position:
-            logger.info(f"Placing Bid for YES: {size_yes} shares @ {bid_price_yes:.2f}")
-            self.client.place_limit_order(yes_token, bid_price_yes, size_yes, "buy")
-            orders_summary.append(f"• BUY YES: `{size_yes} shares @ {bid_price_yes}`")
-        else:
-            logger.warning(f"YES position ({pos_yes}) exceeds max ({self.max_position}). Skipping YES bid.")
-
-        if pos_no < self.max_position:
-            logger.info(f"Placing Bid for NO: {size_no} shares @ {bid_price_no:.2f}")
-            self.client.place_limit_order(no_token, bid_price_no, size_no, "buy")
-            orders_summary.append(f"• BUY NO: `{size_no} shares @ {bid_price_no}`")
-        else:
-            logger.warning(f"NO position ({pos_no}) exceeds max ({self.max_position}). Skipping NO bid.")
-
-        # 6. If we have inventory (both YES and NO), we can place limit asks to close them out
-        if pos_yes > 5.0:  # Minimum share size for sell
-            ask_price_yes = round(mid_yes + (self.spread / 2.0), 2)
-            ask_price_yes = max(0.01, min(0.99, ask_price_yes))
-            logger.info(f"Placing Ask for YES: {pos_yes} shares @ {ask_price_yes:.2f}")
-            self.client.place_limit_order(yes_token, ask_price_yes, pos_yes, "sell")
-            orders_summary.append(f"• SELL YES: `{pos_yes} shares @ {ask_price_yes}`")
-
-        if pos_no > 5.0:
-            ask_price_no = round(mid_no + (self.spread / 2.0), 2)
-            ask_price_no = max(0.01, min(0.99, ask_price_no))
-            logger.info(f"Placing Ask for NO: {pos_no} shares @ {ask_price_no:.2f}")
-            self.client.place_limit_order(no_token, ask_price_no, pos_no, "sell")
-            orders_summary.append(f"• SELL NO: `{pos_no} shares @ {ask_price_no}`")
-            
-        if orders_summary:
-            summary_text = "\n".join(orders_summary)
-            await self.notifier.send_message(
-                f"📊 **Market Making Orders Placed**\n"
-                f"Market: `{market['question'][:60]}...`\n"
-                f"{summary_text}"
+            result = await self._call(
+                self.client.place_limit_order,
+                token_id,
+                price,
+                size,
+                side.lower(),
+                tick_size,
             )
-
-    async def _run_yes_no_offset(self, market):
-        """
-        Executes Yes/No Offset strategy on a market:
-        - Place buy order for YES.
-        - Place buy order for NO.
-        - Results in instant volume with neutral risk.
-        """
-        yes_token = market["yes_token"]
-        no_token = market["no_token"]
-
-        try:
-            mid_yes = self.client.get_midpoint_price(yes_token)
-        except Exception:
-            mid_yes = float(market["prices"][0])
-        mid_no = 1.0 - mid_yes
-
-        # Use midpoint as the order price (acts as immediate taker or tight maker limit)
-        price_yes = round(mid_yes, 2)
-        price_no = round(mid_no, 2)
-
-        size_yes = round(self.order_size / price_yes, 2)
-        size_no = round(self.order_size / price_no, 2)
-
-        logger.info(f"Offsetting: Buying {size_yes} YES shares @ {price_yes:.2f} AND {size_no} NO shares @ {price_no:.2f}")
-        
-        # Place both orders
-        self.client.place_limit_order(yes_token, price_yes, size_yes, "buy")
-        self.client.place_limit_order(no_token, price_no, size_no, "buy")
-        
-        await self.notifier.send_message(
-            f"⚡ **Offset Orders Executed**\n"
-            f"Market: `{market['question'][:60]}...`\n"
-            f"• BUY YES: `{size_yes} shares @ {price_yes}`\n"
-            f"• BUY NO: `{size_no} shares @ {price_no}`"
-        )
+            self.last_quotes[key] = (price, size, time.time())
+            logger.info("%s quote %s @ %.4f size %.4f -> %s", side, token_id[:10], price, size, result)
+        except ValueError as exc:
+            logger.info("Quote skipped: %s", exc)
 
     async def shutdown(self):
-        """Cancels orders and stops the bot."""
-        logger.info("Shutting down bot. Cancelling all open orders...")
+        logger.info("Shutting down: canceling open orders")
         try:
-            self.client.cancel_all_orders()
-        except Exception as e:
-            logger.error(f"Error canceling orders during shutdown: {e}")
-        await self.notifier.send_message("🛑 **Polymarket Volume Bot Stopped**")
-        logger.info("Shutdown complete.")
+            await self._call(self.client.cancel_all_orders)
+        except Exception as exc:
+            logger.error("Shutdown cancellation failed: %s", exc)
+        try:
+            await self._notify("🛑 **Polymarket MM Stopped**")
+        except Exception:
+            pass
+
 
 def main():
     bot = VolumeBot()
     try:
         asyncio.run(bot.start())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
+        logger.info("Stopped by user")
+
 
 if __name__ == "__main__":
     main()
