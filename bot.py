@@ -6,11 +6,7 @@ from config import Config
 from client import PolymarketClient
 from telegram_notifier import TelegramNotifier
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger("PolymarketBot.Core")
 
 
@@ -64,10 +60,7 @@ class VolumeBot:
             if not order["id"]:
                 continue
             created = order["created_at"]
-            stale = False
-            if isinstance(created, (int, float)):
-                stale = now - float(created) > Config.STALE_ORDER_SECONDS
-            if stale:
+            if isinstance(created, (int, float)) and now - float(created) > Config.STALE_ORDER_SECONDS:
                 try:
                     await self._call(self.client.cancel_order, order["id"])
                     logger.info("Canceled stale order %s", order["id"])
@@ -88,16 +81,8 @@ class VolumeBot:
 
     async def start(self):
         logger.info("Starting hardened Polymarket market maker")
-        logger.info("Dry run=%s | order=$%.2f | spread=%.4f | max position=%.2f | max exposure=%.2f",
-                    Config.DRY_RUN, Config.ORDER_SIZE, Config.SPREAD,
-                    Config.MAX_POSITION, Config.MAX_TOTAL_EXPOSURE)
-        await self._notify(
-            f"🤖 **Polymarket MM Started**\n"
-            f"• Dry run: `{Config.DRY_RUN}`\n"
-            f"• Order size: `${Config.ORDER_SIZE:.2f}`\n"
-            f"• Spread: `{Config.SPREAD:.4f}`\n"
-            f"• Max exposure: `${Config.MAX_TOTAL_EXPOSURE:.2f}`"
-        )
+        logger.info("Dry run=%s | order=$%.2f | spread=%.4f | max position=%.2f | max exposure=%.2f", Config.DRY_RUN, Config.ORDER_SIZE, Config.SPREAD, Config.MAX_POSITION, Config.MAX_TOTAL_EXPOSURE)
+        await self._notify(f"🤖 **Polymarket MM Started**\n• Dry run: `{Config.DRY_RUN}`\n• Order size: `${Config.ORDER_SIZE:.2f}`\n• Spread: `{Config.SPREAD:.4f}`\n• Max exposure: `${Config.MAX_TOTAL_EXPOSURE:.2f}`")
         self.is_running = True
         try:
             while self.is_running and not self.kill_switch:
@@ -119,13 +104,11 @@ class VolumeBot:
         if not markets:
             logger.info("No eligible active markets")
             return
-
         open_orders = await self._call(self.client.get_open_orders)
         if len(open_orders) > Config.MAX_OPEN_ORDERS:
             await self._emergency_stop("Open-order limit exceeded")
             return
         await self._cancel_stale_orders(open_orders)
-
         for market in markets[:Config.MAX_MARKETS]:
             if self.kill_switch:
                 return
@@ -140,56 +123,40 @@ class VolumeBot:
                     return
 
     async def _quote_market(self, market):
-        if not market.get("active", True):
+        if not market.get("active", True) or market.get("liquidity", 0) < Config.MIN_LIQUIDITY:
             return
-        if market.get("liquidity", 0) < Config.MIN_LIQUIDITY:
-            logger.debug("Skipping %s: insufficient liquidity", market.get("slug"))
-            return
-
-        yes = market["yes_token"]
-        no = market["no_token"]
+        yes, no = market["yes_token"], market["no_token"]
         yes_bid, yes_ask, yes_mid = await self._call(self.client.quote_from_book, yes)
         no_bid, no_ask, no_mid = await self._call(self.client.quote_from_book, no)
-
         if yes_ask - yes_bid > Config.MAX_SPREAD or no_ask - no_bid > Config.MAX_SPREAD:
-            logger.info("Skipping %s: book spread too wide", market.get("slug"))
             return
-
         pos_yes = await self._call(self.client.get_position, yes)
         pos_no = await self._call(self.client.get_position, no)
         current_exposure = abs(pos_yes) * yes_mid + abs(pos_no) * no_mid
         if current_exposure >= Config.MAX_TOTAL_EXPOSURE:
-            logger.info("Skipping buys for %s: exposure %.2f >= %.2f", market.get("slug"), current_exposure, Config.MAX_TOTAL_EXPOSURE)
             return
 
         yes_rules = await self._call(self.client.get_market_rules, yes)
         no_rules = await self._call(self.client.get_market_rules, no)
-        tick_yes = yes_rules["tick_size"]
-        tick_no = no_rules["tick_size"]
-
-        # Passive quotes only: improve neither side through the spread.
-        yes_price = min(yes_ask - tick_yes, yes_mid - Config.SPREAD / 2)
-        no_price = min(no_ask - tick_no, no_mid - Config.SPREAD / 2)
-        yes_price = self.client.round_price(yes_price, tick_yes)
-        no_price = self.client.round_price(no_price, tick_no)
-
+        tick_yes, tick_no = yes_rules["tick_size"], no_rules["tick_size"]
+        yes_price = self.client.round_price(min(yes_ask - tick_yes, yes_mid - Config.SPREAD / 2), tick_yes)
+        no_price = self.client.round_price(min(no_ask - tick_no, no_mid - Config.SPREAD / 2), tick_no)
         yes_size = Config.ORDER_SIZE / max(yes_price, 0.01)
         no_size = Config.ORDER_SIZE / max(no_price, 0.01)
+        neg_risk = bool(market.get("neg_risk", False))
 
         if pos_yes < Config.MAX_POSITION and current_exposure + Config.ORDER_SIZE <= Config.MAX_TOTAL_EXPOSURE:
-            await self._ensure_quote(yes, "BUY", yes_price, yes_size, tick_yes)
+            await self._ensure_quote(yes, "BUY", yes_price, yes_size, tick_yes, neg_risk)
         if pos_no < Config.MAX_POSITION and current_exposure + Config.ORDER_SIZE <= Config.MAX_TOTAL_EXPOSURE:
-            await self._ensure_quote(no, "BUY", no_price, no_size, tick_no)
-
-        # Inventory reduction: only quote an ask when inventory exists.
+            await self._ensure_quote(no, "BUY", no_price, no_size, tick_no, neg_risk)
         if pos_yes > 0:
-            ask = max(yes_bid + tick_yes, yes_mid + Config.SPREAD / 2)
-            await self._ensure_quote(yes, "SELL", self.client.round_price(ask, tick_yes), pos_yes, tick_yes)
+            ask = self.client.round_price(max(yes_bid + tick_yes, yes_mid + Config.SPREAD / 2), tick_yes)
+            await self._ensure_quote(yes, "SELL", ask, pos_yes, tick_yes, neg_risk)
         if pos_no > 0:
-            ask = max(no_bid + tick_no, no_mid + Config.SPREAD / 2)
-            await self._ensure_quote(no, "SELL", self.client.round_price(ask, tick_no), pos_no, tick_no)
+            ask = self.client.round_price(max(no_bid + tick_no, no_mid + Config.SPREAD / 2), tick_no)
+            await self._ensure_quote(no, "SELL", ask, pos_no, tick_no, neg_risk)
 
-    async def _ensure_quote(self, token_id, side, price, size, tick_size):
+    async def _ensure_quote(self, token_id, side, price, size, tick_size, neg_risk):
         key = (token_id, side)
         previous = self.last_quotes.get(key)
         if previous:
@@ -197,14 +164,7 @@ class VolumeBot:
             if abs(old_price - price) < Config.REPRICE_THRESHOLD and time.time() - timestamp < Config.STALE_ORDER_SECONDS:
                 return
         try:
-            result = await self._call(
-                self.client.place_limit_order,
-                token_id,
-                price,
-                size,
-                side.lower(),
-                tick_size,
-            )
+            result = await self._call(self.client.place_limit_order, token_id, price, size, side.lower(), tick_size, neg_risk)
             self.last_quotes[key] = (price, size, time.time())
             logger.info("%s quote %s @ %.4f size %.4f -> %s", side, token_id[:10], price, size, result)
         except ValueError as exc:
@@ -216,10 +176,7 @@ class VolumeBot:
             await self._call(self.client.cancel_all_orders)
         except Exception as exc:
             logger.error("Shutdown cancellation failed: %s", exc)
-        try:
-            await self._notify("🛑 **Polymarket MM Stopped**")
-        except Exception:
-            pass
+        await self._notify("🛑 **Polymarket MM Stopped**")
 
 
 def main():
