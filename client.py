@@ -1,295 +1,241 @@
 import json
 import logging
+import time
+from decimal import Decimal, ROUND_DOWN
 import requests
 from config import Config
 
-# Configure logger
 logger = logging.getLogger("PolymarketBot.Client")
-logger.setLevel(logging.INFO)
 
-# Try importing py_clob_client_v2 dynamically
-# This allows testing the logic and running in simulation/dry-run mode
-# even if the heavy library or dependencies fail to install in a sandbox.
 try:
-    from py_clob_client_v2 import ClobClient, ApiCreds, OrderArgs, OrderType, PartialCreateOrderOptions, Side, BalanceAllowanceParams, AssetType
+    from py_clob_client_v2 import (
+        ClobClient, ApiCreds, OrderArgs, OrderType,
+        PartialCreateOrderOptions, Side, BalanceAllowanceParams, AssetType
+    )
     CLOB_SDK_AVAILABLE = True
 except ImportError:
     CLOB_SDK_AVAILABLE = False
-    logger.warning("py_clob_client_v2 not installed. Bot will only support DRY_RUN (simulation) mode.")
+
 
 class PolymarketClient:
     def __init__(self):
         self.dry_run = Config.DRY_RUN
         self.clob_client = None
         self.authenticated = False
-        
-        # Configure session with proxy if configured in environment
         self.session = requests.Session()
-        # requests automatically picks up HTTP_PROXY and HTTPS_PROXY environment variables.
-        
+        self.market_rules = {}
+        self._market_rules_ttl = 300
+        self._last_rules_refresh = {}
         if not self.dry_run:
             if not CLOB_SDK_AVAILABLE:
-                raise ImportError("py-clob-client-v2 must be installed to run in live mode.")
+                raise ImportError("py-clob-client-v2 is required when DRY_RUN=false")
             self._init_clob_client()
-        else:
-            logger.info("Initializing Polymarket Client in DRY_RUN (simulation) mode.")
 
     def _init_clob_client(self):
-        """Initializes the actual Polymarket CLOB client using PK and API credentials."""
-        try:
-            logger.info("Initializing CLOB client and L1 authentication...")
-            # Initialize with L1 Wallet credentials, signature type, and funder (deposit wallet).
-            # SIGNATURE_TYPE=3 (POLY_1271) is required when using the deposit wallet flow.
-            # FUNDER must be the deposit/proxy wallet address from Polymarket profile.
-            self.clob_client = ClobClient(
-                host=Config.CLOB_API_URL, 
-                chain_id=137, 
-                key=Config.PK,
-                signature_type=Config.SIGNATURE_TYPE,
-                funder=Config.FUNDER
-            )
-            
-            # Derive L2 API credentials if not explicitly provided.
-            # When using deposit wallet flow (POLY_1271), credentials are derived relative
-            # to the funder address, not the raw EOA, so we pass the same context.
-            if Config.API_KEY and Config.API_SECRET and Config.API_PASSPHRASE:
-                logger.info("Using provided L2 API credentials.")
-                creds = ApiCreds(
-                    api_key=Config.API_KEY,
-                    api_secret=Config.API_SECRET,
-                    api_passphrase=Config.API_PASSPHRASE
-                )
+        bootstrap = ClobClient(
+            host=Config.CLOB_API_URL,
+            chain_id=137,
+            key=Config.PK,
+            signature_type=Config.SIGNATURE_TYPE,
+            funder=Config.FUNDER,
+        )
+        if Config.API_KEY and Config.API_SECRET and Config.API_PASSPHRASE:
+            creds = ApiCreds(api_key=Config.API_KEY, api_secret=Config.API_SECRET, api_passphrase=Config.API_PASSPHRASE)
+        else:
+            raw = bootstrap.create_or_derive_api_key()
+            if hasattr(raw, "api_key"):
+                creds = raw
             else:
-                logger.info("Deriving/creating L2 API credentials from wallet signature...")
-                raw_creds = self.clob_client.create_or_derive_api_key()
-                
-                # Support both dictionary and ApiCreds object structures returned by the SDK
-                if hasattr(raw_creds, "api_key") and raw_creds.api_key:
-                    creds = raw_creds
-                elif isinstance(raw_creds, dict):
-                    creds = ApiCreds(
-                        api_key=raw_creds.get("apiKey") or raw_creds.get("api_key"),
-                        api_secret=raw_creds.get("apiSecret") or raw_creds.get("api_secret"),
-                        api_passphrase=raw_creds.get("apiPassphrase") or raw_creds.get("api_passphrase")
-                    )
-                else:
-                    creds = ApiCreds(
-                        api_key=getattr(raw_creds, "api_key", None) or getattr(raw_creds, "apiKey", None),
-                        api_secret=getattr(raw_creds, "api_secret", None) or getattr(raw_creds, "apiSecret", None),
-                        api_passphrase=getattr(raw_creds, "api_passphrase", None) or getattr(raw_creds, "apiPassphrase", None)
-                    )
-            
-            # Re-initialize CLOB client with BOTH L1+L2 auth AND the deposit wallet context.
-            # CRITICAL: signature_type and funder MUST be passed here too — omitting them
-            # causes orders to be built with the raw EOA as maker, triggering the 
-            # "maker address not allowed, please use the deposit wallet flow" 400 error.
-            self.clob_client = ClobClient(
-                host=Config.CLOB_API_URL, 
-                chain_id=137, 
-                key=Config.PK,
-                creds=creds,
-                signature_type=Config.SIGNATURE_TYPE,
-                funder=Config.FUNDER
-            )
-            self.authenticated = True
-            logger.info("CLOB Client authenticated successfully.")
-        except Exception as e:
-            logger.error(f"Failed to initialize CLOB client: {e}")
-            raise e
+                creds = ApiCreds(
+                    api_key=raw.get("apiKey") or raw.get("api_key"),
+                    api_secret=raw.get("apiSecret") or raw.get("api_secret"),
+                    api_passphrase=raw.get("apiPassphrase") or raw.get("api_passphrase"),
+                )
+        self.clob_client = ClobClient(
+            host=Config.CLOB_API_URL,
+            chain_id=137,
+            key=Config.PK,
+            creds=creds,
+            signature_type=Config.SIGNATURE_TYPE,
+            funder=Config.FUNDER,
+        )
+        self.authenticated = True
+
+    @staticmethod
+    def _parse_token_ids(value):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                return []
+        return value if isinstance(value, list) else []
 
     def fetch_world_cup_markets(self):
-        """Fetches active World Cup match markets from the Gamma API."""
-        url = f"{Config.GAMMA_API_URL}/public-search?q=World+Cup"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
         try:
-            logger.info("Querying Gamma API for World Cup markets...")
-            response = self.session.get(url, headers=headers, timeout=10)
+            response = self.session.get(
+                f"{Config.GAMMA_API_URL}/public-search",
+                params={"q": "World Cup"},
+                headers={"User-Agent": "PolymarketMM/2.0"},
+                timeout=10,
+            )
             response.raise_for_status()
-            search_data = response.json()
-            
+            data = response.json()
             markets = []
-            events = search_data.get("events") or []
-            for event in events:
-                if not event.get("active", True):
+            for event in data.get("events") or []:
+                if event.get("closed") or event.get("active") is False:
                     continue
-                
-                event_title = event.get("title", "")
-                logger.info(f"Processing Event: {event_title}")
-                
-                event_markets = event.get("markets") or []
-                for m in event_markets:
-                    if not m.get("active", True):
+                for market in event.get("markets") or []:
+                    if market.get("closed") or market.get("active") is False:
                         continue
-                    
-                    question = m.get("question", "")
-                    clob_token_ids_raw = m.get("clobTokenIds")
-                    
-                    # clobTokenIds can be a string-encoded JSON array or a python list
-                    clob_token_ids = []
-                    if isinstance(clob_token_ids_raw, str):
-                        try:
-                            clob_token_ids = json.loads(clob_token_ids_raw)
-                        except json.JSONDecodeError:
-                            pass
-                    elif isinstance(clob_token_ids_raw, list):
-                        clob_token_ids = clob_token_ids_raw
-                    
-                    # We need at least YES and NO tokens (index 0 and 1)
-                    if len(clob_token_ids) >= 2:
-                        markets.append({
-                            "question": question,
-                            "slug": m.get("slug", ""),
-                            "yes_token": clob_token_ids[0],
-                            "no_token": clob_token_ids[1],
-                            "prices": m.get("outcomePrices") or ["0.50", "0.50"]
-                        })
-            
-            logger.info(f"Discovered {len(markets)} active World Cup markets.")
-            return markets
-            
-        except Exception as e:
-            logger.warning(f"Error querying Gamma API: {e}.")
+                    tokens = self._parse_token_ids(market.get("clobTokenIds"))
+                    if len(tokens) < 2:
+                        continue
+                    prices = market.get("outcomePrices") or []
+                    try:
+                        yes_price = float(prices[0]) if prices else 0.5
+                    except (ValueError, TypeError):
+                        yes_price = 0.5
+                    markets.append({
+                        "question": market.get("question") or event.get("title") or "Unknown",
+                        "slug": market.get("slug", ""),
+                        "yes_token": tokens[0],
+                        "no_token": tokens[1],
+                        "prices": [yes_price, max(0.0, 1.0 - yes_price)],
+                        "active": True,
+                        "end_date": market.get("endDate") or event.get("endDate"),
+                        "liquidity": float(market.get("liquidity") or 0),
+                        "neg_risk": bool(market.get("negRisk", False)),
+                    })
+            markets.sort(key=lambda m: m["liquidity"], reverse=True)
+            return markets[:Config.MAX_MARKETS]
+        except Exception as exc:
+            logger.error("Market discovery failed: %s", exc)
             if self.dry_run:
-                logger.info("Dry-run fallback: Loading mock World Cup match markets.")
                 return self._get_mock_world_cup_markets()
-            return []
-
-    def get_midpoint_price(self, token_id):
-        """Fetches the current midpoint price of a specific token from the CLOB API."""
-        if self.dry_run:
-            # Simple mock price simulation
-            import random
-            return round(0.48 + random.random() * 0.04, 2)
-            
-        try:
-            # Call CLOB API midpoint endpoint
-            resp = self.clob_client.get_midpoint(token_id)
-            return float(resp.get("midpoint", 0.50))
-        except Exception as e:
-            logger.error(f"Error getting midpoint price for token {token_id}: {e}")
-            raise e
+            raise RuntimeError(f"Market discovery failed: {exc}") from exc
 
     def get_order_book(self, token_id):
-        """Fetches the order book for a specific token."""
         if self.dry_run:
-            # Return a mock order book
-            return {
-                "bids": [{"price": "0.49", "size": "100"}, {"price": "0.48", "size": "200"}],
-                "asks": [{"price": "0.51", "size": "150"}, {"price": "0.52", "size": "300"}]
-            }
-        try:
-            return self.clob_client.get_order_book(token_id)
-        except Exception as e:
-            logger.error(f"Error getting order book for token {token_id}: {e}")
-            raise e
+            return {"bids": [{"price": "0.49", "size": "100"}], "asks": [{"price": "0.51", "size": "100"}]}
+        return self.clob_client.get_order_book(token_id)
 
-    def place_limit_order(self, token_id, price, size, side):
-        """Places a limit order on the Polymarket CLOB."""
-        side_str = "BUY" if side == "buy" or side == Side.BUY else "SELL"
-        
+    @staticmethod
+    def _levels(book, side):
+        raw = book.get(side) if isinstance(book, dict) else getattr(book, side, None)
+        return raw or []
+
+    @staticmethod
+    def _level_value(level, key):
+        if isinstance(level, dict):
+            return float(level[key])
+        return float(getattr(level, key))
+
+    def quote_from_book(self, token_id):
+        book = self.get_order_book(token_id)
+        bids = self._levels(book, "bids")
+        asks = self._levels(book, "asks")
+        if not bids or not asks:
+            raise RuntimeError("Order book has no two-sided liquidity")
+        best_bid = max(self._level_value(x, "price") for x in bids)
+        best_ask = min(self._level_value(x, "price") for x in asks)
+        if not (0 < best_bid < best_ask < 1):
+            raise RuntimeError(f"Invalid book: bid={best_bid}, ask={best_ask}")
+        return best_bid, best_ask, (best_bid + best_ask) / 2.0
+
+    def get_market_rules(self, token_id, fallback_tick=0.01):
+        now = time.time()
+        cached = self.market_rules.get(token_id)
+        if cached and now - self._last_rules_refresh.get(token_id, 0) < self._market_rules_ttl:
+            return cached
+        tick = fallback_tick
+        min_size = 5.0
+        if not self.dry_run:
+            try:
+                getter = getattr(self.clob_client, "get_tick_size", None)
+                if getter:
+                    tick = float(getter(token_id))
+            except Exception:
+                pass
+            try:
+                getter = getattr(self.clob_client, "get_min_order_size", None)
+                if getter:
+                    min_size = float(getter(token_id))
+            except Exception:
+                pass
+            try:
+                response = self.session.get(f"{Config.CLOB_API_URL}/tick-size", params={"token_id": token_id}, timeout=5)
+                if response.ok:
+                    payload = response.json()
+                    tick = float(payload.get("minimum_tick_size", payload.get("tick_size", tick)))
+            except Exception:
+                pass
+        if tick <= 0:
+            tick = fallback_tick
+        self.market_rules[token_id] = {"tick_size": tick, "min_size": min_size}
+        self._last_rules_refresh[token_id] = now
+        return self.market_rules[token_id]
+
+    @staticmethod
+    def round_price(price, tick_size):
+        tick = Decimal(str(tick_size))
+        value = (Decimal(str(price)) / tick).to_integral_value(rounding=ROUND_DOWN) * tick
+        return float(max(Decimal("0.01"), min(Decimal("0.99"), value)))
+
+    def place_limit_order(self, token_id, price, size, side, tick_size=0.01, neg_risk=False):
+        price = self.round_price(price, tick_size)
+        size = float(size)
+        if size <= 0:
+            raise ValueError("Order size must be positive")
+        rules = self.get_market_rules(token_id, tick_size)
+        if size < rules["min_size"]:
+            raise ValueError(f"Order size {size} is below market minimum {rules['min_size']}")
         if self.dry_run:
-            logger.info(f"[SIMULATION] Placing LIMIT {side_str} order on token {token_id[:10]}... | Price: {price} | Size: {size}")
-            return {"status": "SUCCESS", "orderID": "mock-order-id"}
-            
-        try:
-            # Setup order parameters
-            clob_side = Side.BUY if side == "buy" else Side.SELL
-            resp = self.clob_client.create_and_post_order(
-                order_args=OrderArgs(
-                    token_id=token_id,
-                    price=float(price),
-                    side=clob_side,
-                    size=float(size)
-                ),
-                options=PartialCreateOrderOptions(tick_size="0.01"),
-                order_type=OrderType.GTC
-            )
-            logger.info(f"Order placed successfully: {resp}")
-            return resp
-        except Exception as e:
-            error_text = str(e)
-            if "maker address not allowed" in error_text.lower() or "deposit wallet flow" in error_text.lower():
-                raise RuntimeError(
-                    "DEPOSIT WALLET FLOW ERROR: Polymarket rejected the order because the "
-                    "maker address is your raw EOA, not the deposit wallet.\n\n"
-                    "TO FIX:\n"
-                    "1. Go to your Polymarket profile and copy your Deposit Wallet address.\n"
-                    "2. Add this to your .env file:\n"
-                    "   FUNDER=0xYourDepositWalletAddress\n"
-                    "   SIGNATURE_TYPE=3\n"
-                    "3. Restart the bot."
-                ) from e
-            logger.error(f"Error placing order: {e}")
-            raise e
+            return {"status": "SIMULATED", "orderID": f"dry-{token_id[:8]}-{int(time.time()*1000)}"}
+        clob_side = Side.BUY if str(side).lower() == "buy" else Side.SELL
+        options = PartialCreateOrderOptions(tick_size=str(rules["tick_size"]), neg_risk=bool(neg_risk))
+        return self.clob_client.create_and_post_order(
+            order_args=OrderArgs(token_id=token_id, price=price, side=clob_side, size=size),
+            options=options,
+            order_type=OrderType.GTC,
+            post_only=True,
+        )
+
+    def cancel_order(self, order_id):
+        if self.dry_run:
+            return {"status": "SIMULATED"}
+        cancel = getattr(self.clob_client, "cancel", None)
+        if not cancel:
+            raise RuntimeError("Installed CLOB SDK does not expose single-order cancellation")
+        return cancel(order_id)
 
     def cancel_all_orders(self):
-        """Cancels all active orders for the authenticated account."""
         if self.dry_run:
-            logger.info("[SIMULATION] Canceling all active open orders.")
-            return {"status": "SUCCESS"}
-            
-        try:
-            resp = self.clob_client.cancel_all()
-            logger.info("All open orders cancelled.")
-            return resp
-        except Exception as e:
-            logger.error(f"Error canceling all orders: {e}")
-            raise e
+            return {"status": "SIMULATED"}
+        return self.clob_client.cancel_all()
 
     def get_open_orders(self):
-        """Fetches active open orders."""
         if self.dry_run:
             return []
-        try:
-            # Returns list of open orders from CLOB
-            return self.clob_client.get_open_orders()
-        except Exception as e:
-            logger.error(f"Error getting open orders: {e}")
-            return []
+        return self.clob_client.get_open_orders()
 
     def get_position(self, token_id):
-        """Fetches current position size in shares for the token."""
         if self.dry_run:
-            # Return a mock position
             return 0.0
-            
         try:
-            # In CLOB V2 SDK, get_balance_allowance is used
-            params = BalanceAllowanceParams(
-                asset_type=AssetType.CONDITIONAL,
-                token_id=token_id
-            )
-            balance_raw = self.clob_client.get_balance_allowance(params)
-            return float(balance_raw.get("balance", 0.0))
-        except Exception as e:
-            logger.error(f"Error fetching position for token {token_id}: {e}")
-            return 0.0
+            params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+            raw = self.clob_client.get_balance_allowance(params)
+            return float(raw.get("balance", 0.0))
+        except Exception as exc:
+            raise RuntimeError(f"Position lookup failed for {token_id}: {exc}") from exc
 
     def _get_mock_world_cup_markets(self):
-        """Returns mock active World Cup matches for dry-run simulation purposes."""
-        return [
-            {
-                "question": "Will Argentina win against France in the World Cup match?",
-                "slug": "argentina-vs-france-2026",
-                "yes_token": "83471029384729183472918374921873918237492183749218374921837491",
-                "no_token": "92837492837492837492837492837492837492837492837492837492837492",
-                "prices": ["0.52", "0.48"]
-            },
-            {
-                "question": "Will Brazil score more than 2 goals against Germany?",
-                "slug": "brazil-vs-germany-goals",
-                "yes_token": "11223344556677889900112233445566778899001122334455667788990011",
-                "no_token": "22334455667788990011223344556677889900112233445566778899001122",
-                "prices": ["0.45", "0.55"]
-            },
-            {
-                "question": "Will USA qualify for the World Cup quarter-finals?",
-                "slug": "usa-qualify-quarters",
-                "yes_token": "33445566778899001122334455667788990011223344556677889900112233",
-                "no_token": "44556677889900112233445566778899001122334455667788990011223344",
-                "prices": ["0.30", "0.70"]
-            }
-        ]
+        return [{
+            "question": "SIMULATION: World Cup market",
+            "slug": "simulation-market",
+            "yes_token": "SIM_YES",
+            "no_token": "SIM_NO",
+            "prices": [0.50, 0.50],
+            "active": True,
+            "liquidity": 1000.0,
+            "neg_risk": False,
+        }]
